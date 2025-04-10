@@ -1,0 +1,20 @@
+{
+       "version": "0.2.0",
+       "configurations": [
+
+         {
+           "name": "Run Client with Args",
+           "type": "debugpy",
+           "request": "launch",
+           "program": "${workspaceFolder}/client.py",
+           "console": "integratedTerminal",
+           "args": [
+             "-u", "Alice",
+             "-sip", "127.0.0.1",
+             "-sp", "10000",
+             "-p", "abcd1234"
+           ]
+         }
+       ]
+     }
+     
