@@ -1,5 +1,3 @@
-# secure_server.py
-
 import socket
 import argparse
 import json
