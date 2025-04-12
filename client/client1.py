@@ -9,7 +9,6 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hmac
 from argon2 import low_level
-import time
 
 class Client:
     FORMAT = 'utf-8'
@@ -26,8 +25,7 @@ class Client:
         self.authenticated = False
         self.peer_keys = {}  # Stores session keys per peer
         self.peer_addresses = {}  # Stores actual address/port of peers
-        self.ephemeral_private_keys = {}  # Store ephemeral private keys per peer
-
+        self.ephemeral_private_key = None
         
         try:
             self.client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -59,8 +57,7 @@ class Client:
                 if command[0] == "list":
                     self.list()
                 elif command[0] == "send" and len(command) == 3:
-#                    self.send(command[1], command[2])
-                    self.send_encrypted_message(command[1], command[2])
+                    self.send(command[1], command[2])
                 elif command[0] == self.DISCONNECT_MESSAGE:
                     self.disconnect()
                     break
@@ -232,191 +229,110 @@ class Client:
                 # Handle list response
                 if message.get('type') == 'list_response' and message.get('users'):
                     print("Online users:", ", ".join(message['users']))
-                    
                 # Handle error messages
                 elif message.get('type') == 'error':
                     print(f"Error: {message.get('message')}")
 
-                # Handle key exchange initiation
-                elif message.get('type') == 'key_request':
-                    self.handle_key_request(message, addr)
-            
-                # Handle key exchange response
-                elif message.get('type') == 'key_response':
-                    self.handle_key_response(message, addr)
-            
-                # Handle encrypted P2P messages
-                elif message.get('type') == 'encrypted_message':
-                    self.handle_encrypted_message(message)
-            
-                # Handle other messages
-                else:
-                    print(f"Received message: {message}")
+#                elif message['type'] == 'message' and message['message'] == '[KEY_REQUEST]':
+#                    peer_username = message['from']
+#                    print(f"Received key exchange request from {peer_username}")
 
+                    # Step 3: Generate ephemeral keypair
+#                    self.ephemeral_private_key = ec.generate_private_key(ec.SECP384R1())
+#                    ephemeral_public_key = self.ephemeral_private_key.public_key()
+
+                    # Step 4: Send ephemeral public key to peer
+#                    response_msg = {
+#                        'type': 'message',
+#                        'from': self.username,
+#                        'message': json.dumps({
+#                            'ephemeral_pubkey': ephemeral_public_key.public_bytes(
+#                                serialization.Encoding.PEM,
+#                                serialization.PublicFormat.SubjectPublicKeyInfo
+#                            ).decode()
+#                        })
+#                    }
+#                    peer_info = self.clients[peer_username]
+#                    self.client.sendto(json.dumps(response_msg).encode(), (peer_info['actual_address'], peer_info['actual_port']))
+
+#                elif message['type'] == 'message':
+                    # Step 5: Handle public key and compute shared secret
+#                    try:
+#                        payload = json.loads(message['message'])
+#                        if 'ephemeral_pubkey' in payload:
+#                            peer_public = serialization.load_pem_public_key(payload['ephemeral_pubkey'].encode())
+#                            shared = self.ephemeral_private_key.exchange(ec.ECDH(), peer_public)
+
+#                            self.session_key = HKDF(
+#                                algorithm=hashes.SHA256(),
+#                                length=32,
+#                                salt=None,
+#                                info=b'p2p_session_key'
+#                            ).derive(shared)
+
+#                            print(f"Established P2P session key with {message['from']}: {self.session_key[:8].hex()}")
+#                    except Exception:
+#                        print(f"Message from {message['from']}: {message['message']}")
+    
+                # Handle normal messages
+                elif message.get('type') == 'message' and message.get('from') and message.get('message'):
+                    sender = message['from']
+                    msg = message['message']
+
+                    if msg == '[KEY_REQUEST]':
+                        print(f"Received key exchange request from {sender}")
+                        self.ephemeral_private_key = ec.generate_private_key(ec.SECP384R1())
+                        pub_key = self.ephemeral_private_key.public_key().public_bytes(
+                            serialization.Encoding.PEM,
+                            serialization.PublicFormat.SubjectPublicKeyInfo
+                        ).decode()
+
+                        # Store sender's IP/port for direct messaging later
+                        self.peer_addresses[sender] = (message.get('actual_address') or addr[0], message.get('actual_port') or addr[1])
+
+                        response = {
+                            'type': 'send',
+                            'to': sender,
+                            'from': self.username,
+                            'message': json.dumps({'ephemeral_pubkey': pub_key})
+                        }
+                        self.client.sendto(json.dumps(response).encode(self.FORMAT), self.ADDR)  # Send via server
+
+                    else:
+                        try:
+                            payload = json.loads(msg)
+                            if 'ephemeral_pubkey' in payload:
+                                peer_pubkey = serialization.load_pem_public_key(payload['ephemeral_pubkey'].encode())
+                                shared_secret = self.ephemeral_private_key.exchange(ec.ECDH(), peer_pubkey)
+                                session_key = HKDF(
+                                    algorithm=hashes.SHA256(),
+                                    length=32,
+                                    salt=None,
+                                    info=b'p2p_session_key'
+                                ).derive(shared_secret)
+                                self.peer_keys[sender] = session_key
+                                self.peer_addresses[sender] = (message.get('actual_address') or addr[0], message.get('actual_port') or addr[1])
+                                print(f"\U0001f510 Session key established with {sender}: {session_key[:8].hex()}")
+                            else:
+                                print(f"Message from {sender}: {msg}")
+                        except Exception:
+                            print(f"Message from {sender}: {msg}")
+
+                elif message.get('type') == 'p2p':
+                    sender = message.get('from')
+                    msg = message.get('message')
+                    # TODO: Decrypt with peer_keys[sender] if encrypted
+                    print(f"[P2P] {sender}: {msg}")
+                
             except json.JSONDecodeError:
                 print("Received invalid JSON data")
             except socket.timeout:
-                pass
+                pass  
             except Exception as e:
                 if self.running:
-                    print(f"Error in receive thread: {e}")
+                    if self.running:
+                        print(f"Error in receive thread: {e}")
 
-    def handle_key_request(self, message, addr):
-        """Handle incoming key exchange request"""
-        sender = message['from']
-        print(f"Key exchange request from {sender}")
-    
-        # Generate ephemeral key pair
-        private_key = ec.generate_private_key(ec.SECP384R1())
-        public_key = private_key.public_key()
-    
-        # Store keys and peer address
-        self.ephemeral_private_keys[sender] = private_key
-        self.peer_addresses[sender] = addr
-    
-        # Prepare response
-        response = {
-            'type': 'key_response',
-            'from': self.username,
-            'public_key': public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode(),
-            'timestamp': int(time.time())
-        }
-    
-        # Send response directly to peer (P2P)
-        self.client.sendto(
-            json.dumps(response).encode(self.FORMAT),
-            addr
-        )
-
-    def handle_key_response(self, message, addr):
-        """Handle key exchange response and establish session key"""
-        sender = message['from']
-        print(f"Processing key response from {sender}")
-    
-        # Load peer's public key
-        peer_pubkey = serialization.load_pem_public_key(
-            message['public_key'].encode()
-        )
-    
-        # Generate our ephemeral key if we haven't already
-        if sender not in self.ephemeral_private_keys:
-            self.ephemeral_private_keys[sender] = ec.generate_private_key(ec.SECP384R1())
-    
-        # Perform ECDH key exchange
-        shared_secret = self.ephemeral_private_keys[sender].exchange(
-            ec.ECDH(),
-            peer_pubkey
-        )
-    
-        # Derive session key using HKDF with timestamp as salt
-        timestamp = str(message['timestamp']).encode()
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=timestamp,
-            info=b'p2p_session_key',
-            backend=default_backend()
-        )
-        session_key = hkdf.derive(shared_secret)
-    
-        # Store session key and peer address
-        self.peer_keys[sender] = session_key
-        self.peer_addresses[sender] = addr
-    
-        print(f"Session established with {sender}")
-        print(f"Session key (first 8 bytes): {session_key[:8].hex()}")
-
-    def handle_encrypted_message(self, message):
-        """Decrypt and handle an encrypted message"""
-        sender = message['from']
-        if sender not in self.peer_keys:
-            print(f"No session key for {sender}, initiating key exchange...")
-            self.initiate_key_exchange(sender)
-            return
-    
-        try:
-            # Decode the base64 encoded message
-            encrypted_msg = base64.b64decode(message['message'])
-        
-            # Decrypt using AES-GCM
-            decrypted_msg = self.decrypt_message(encrypted_msg, self.peer_keys[sender])
-        
-            print(f"\n[Encrypted from {sender}]: {decrypted_msg}")
-        except Exception as e:
-            print(f"Failed to decrypt message from {sender}: {e}")
-
-    def initiate_key_exchange(self, peer_username):
-        """Initiate key exchange with another peer"""
-        if peer_username not in self.peer_addresses:
-            print(f"No address info for {peer_username}")
-       #     return
-    
-        # Generate ephemeral key pair
-        private_key = ec.generate_private_key(ec.SECP384R1())
-        public_key = private_key.public_key()
-    
-        # Store our private key
-        self.ephemeral_private_keys[peer_username] = private_key
-    
-        # Send key request
-        request = {
-            'type': 'key_request',
-            'from': self.username,
-            'timestamp': int(time.time())
-        }
-    
-        self.client.sendto(
-            json.dumps(request).encode(self.FORMAT),
-            self.peer_addresses[peer_username]
-        )
-        print(f"Sent key exchange request to {peer_username}")
-
-    def send_encrypted_message(self, recipient, plaintext):
-        """Send an encrypted message to another peer"""
-        if recipient not in self.peer_keys:
-            print(f"No session key for {recipient}, initiating key exchange...")
-            self.initiate_key_exchange(recipient)
-            return
-    
-        try:
-            # Encrypt the message
-            encrypted_msg = self.encrypt_message(plaintext, self.peer_keys[recipient])
-        
-            # Base64 encode for safe transmission
-            encoded_msg = base64.b64encode(encrypted_msg).decode()
-        
-            # Prepare message
-            message = {
-                'type': 'encrypted_message',
-                'from': self.username,
-                'message': encoded_msg
-            }
-        
-            # Send directly to peer
-            self.client.sendto(
-                json.dumps(message).encode(self.FORMAT),
-                self.peer_addresses[recipient]
-            )
-            print(f"Message encrypted and sent to {recipient}")
-        except Exception as e:
-            print(f"Failed to send encrypted message: {e}")
-
-    def encrypt_message(self, plaintext, key):
-        """Encrypt message using AES-GCM"""
-        aesgcm = AESGCM(key)
-        nonce = os.urandom(12)
-        ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
-        return nonce + ciphertext
-
-    def decrypt_message(self, ciphertext, key):
-        """Decrypt message using AES-GCM"""
-        aesgcm = AESGCM(key)
-        nonce = ciphertext[:12]
-        ciphertext = ciphertext[12:]
-        return aesgcm.decrypt(nonce, ciphertext, None).decode()
 
     def disconnect(self):
         if self.running:
