@@ -1,19 +1,29 @@
-import argparse
 import socket
-import threading
+import argparse
 import json
+import threading
 import queue
 import sys
+import time
+import os
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hmac
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from argon2 import low_level
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('SecureChatClient')
 import time
 
-class Client:
+class SecureClient:
     FORMAT = 'utf-8'
     DISCONNECT_MESSAGE = "!disconnect"
+    # Predefined generator matching server's
+    G = ec.SECP384R1()
 
     def __init__(self, server_port, server_addr, username, password):
         self.running = True
@@ -24,6 +34,10 @@ class Client:
         self.ADDR = (self.server_addr, self.server_port)
         self.message_queue = queue.Queue()
         self.authenticated = False
+        self.session_key = None
+        self.auth_key = None
+        self.message_counter = 0
+        self.peer_connections = {}  # For direct peer connections
         self.peer_keys = {}  # Stores session keys per peer
         self.peer_addresses = {}  # Stores actual address/port of peers
         self.ephemeral_private_keys = {}  # Store ephemeral private keys per peer
@@ -32,32 +46,41 @@ class Client:
         try:
             self.client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.client.bind(('', 0))
+            logger.info(f"Client bound to {self.client.getsockname()}")
         except Exception as e:
-            print("Error initializing client socket:", e)
+            logger.error(f"Error initializing client socket: {e}")
             self.running = False
             raise
 
         # Start the receive thread after initialization
         self.receive_thread = threading.Thread(target=self.receive_from)
-        self.receive_thread.daemon = True  # Make thread exit when main thread exits
+        self.receive_thread.daemon = True
         self.receive_thread.start()
 
     def run(self):
         if not hasattr(self, 'client') or not self.running:
-            print("Client not initialized properly")
+            logger.error("Client not initialized properly")
             return
 
         # First authenticate
         if not self.sign_in():
-            print("Authentication failed. Exiting.")
+            logger.error("Authentication failed. Exiting.")
             self.running = False
             return
+
+        print(f"Successfully connected as {self.username}")
+        print("Available commands: list, discover USERNAME, send USERNAME MESSAGE, !disconnect")
 
         try:
             while self.running:
                 command = input().strip().split(maxsplit=2)
+                if not command:
+                    continue
+                    
                 if command[0] == "list":
                     self.list()
+                elif command[0] == "discover" and len(command) >= 2:
+                    self.discover_peer(command[1])
                 elif command[0] == "send" and len(command) == 3:
 #                    self.send(command[1], command[2])
                     self.send_encrypted_message(command[1], command[2])
@@ -65,45 +88,47 @@ class Client:
                     self.disconnect()
                     break
                 else:
-                    print("Invalid command. Available commands are: list, send USERNAME MESSAGE")
+                    print("Invalid command. Available commands are: list, discover USERNAME, send USERNAME MESSAGE, !disconnect")
 
                 if not self.running:
                     print("Server has shutdown, exiting")
                     break
 
         except Exception as e:
-            print("Exception occurred:", e)
+            logger.error(f"Exception occurred: {e}")
 
         finally:
             sys.exit(0)
 
     def sign_in(self):
         try:
-            print(f"Attempting to authenticate as {self.username}...")
+            logger.info(f"Attempting to authenticate as {self.username}...")
             # Step 1: Send username to server
             message = {
                 'type': "SIGN-IN",
-                'username': self.username,
-                'address': self.client.getsockname()[0],
-                'port': self.client.getsockname()[1]
+                'username': self.username
             }
             self.client.sendto(json.dumps(message).encode(self.FORMAT), self.ADDR)
 
-            # Step 2: Receive public parameters from server
+            # Step 2: Receive salt, server public key and B value
             self.client.settimeout(10)  # Set timeout for authentication
             data, addr = self.client.recvfrom(65535)
             server_params = json.loads(data.decode())
-            print(f"Received server parameters (salt and public key)")
+            logger.info(f"Received server parameters (salt and public key)")
 
-            # Step 3: Generate client's key pair and compute shared secret
-            client_private_key = ec.generate_private_key(ec.SECP384R1())
+            # Step 3: Generate client's key pair
+            client_private_key = ec.generate_private_key(self.G)
             client_public_key = client_private_key.public_key()
+            
+            # Load server's public key
             server_public_key = serialization.load_pem_public_key(
                 server_params['server_public_key'].encode()
             )
+            
+            # Step 4: Compute the shared secret using ECDH
             shared_secret = client_private_key.exchange(ec.ECDH(), server_public_key)
 
-            # Step 4: Compute verifier using Argon2
+            # Step 5: Compute verifier from password and salt
             salt = bytes.fromhex(server_params['salt'])
             verifier = low_level.hash_secret_raw(
                 self.password.encode(self.FORMAT),
@@ -112,154 +137,264 @@ class Client:
                 memory_cost=65536,
                 parallelism=4,
                 hash_len=32,
-                type=low_level.Type.ID  # Using ID type
+                type=low_level.Type.ID
             )
             
-            
-            # Step 5: Combine secrets and derive session key
-            shared_secret_truncated = shared_secret[:32]
-            print(f"Computed shared secret (first few bytes): {shared_secret_truncated[:8].hex()}")
+            # Step 6: Combine shared secret with verifier to create session keys
+            shared_secret_truncated = shared_secret[:32]  # Use first 32 bytes
             combined_secret = bytes(x ^ y for x, y in zip(shared_secret_truncated, verifier))
-            print(f"Computed combined secret (first few bytes): {combined_secret[:8].hex()}")
+            
+            # Step 7: Derive authentication and encryption keys from combined secret
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None, 
+                info=b'auth_key'
+            )
+            self.auth_key = hkdf.derive(combined_secret)
             
             hkdf = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None, 
-                info=b'session_key'
+                info=b'encryption_key'
             )
-            session_key = hkdf.derive(combined_secret)
-            print(f"Computed session key (first few bytes): {session_key[:8].hex()}")
+            self.session_key = hkdf.derive(combined_secret)
+            logger.info(f"Derived session keys")
 
-            # Step 6: Send client public key and HMAC
-            hmac_client = hmac.HMAC(session_key, hashes.SHA256())
-            hmac_client.update(b"client_confirmation")
+            # Step 8: Create client confirmation HMAC
+            h = hmac.HMAC(self.auth_key, hashes.SHA256())
+            h.update(b"client_confirmation")
+            client_hmac = h.finalize()
+            
+            # Step 9: Send client public key and HMAC to server
             confirmation_message = {
                 'client_public_key': client_public_key.public_bytes(
                     serialization.Encoding.PEM,
                     serialization.PublicFormat.SubjectPublicKeyInfo
                 ).decode(),
-                'client_hmac': hmac_client.finalize().hex()
+                'client_hmac': client_hmac.hex()
             }
             self.client.sendto(json.dumps(confirmation_message).encode(self.FORMAT), addr)
-            print("Sent client public key and HMAC to server")
+            logger.info("Sent client public key and HMAC to server")
 
-            # Step 7: Verify server confirmation
+            # Step 10: Receive and verify server's HMAC confirmation
             data, addr = self.client.recvfrom(65535)
-            server_hmac = bytes.fromhex(data.decode())
+            server_response = json.loads(data.decode())
+            
+            if server_response.get('status') != 'ACK' or 'hmac' not in server_response:
+                logger.error("Invalid server confirmation")
+                return False
+                
+            server_hmac = bytes.fromhex(server_response['hmac'])
             
             # Verify server HMAC
-            h = hmac.HMAC(session_key, hashes.SHA256())
+            h = hmac.HMAC(self.auth_key, hashes.SHA256())
             h.update(b"server_confirmation")
             try:
                 h.verify(server_hmac)
-                print(f"Successfully authenticated as {self.username}")
+                logger.info(f"Successfully authenticated as {self.username}")
                 self.client.settimeout(None)  # Reset timeout for normal operation
                 self.authenticated = True
                 return True
             except Exception as e:
-                print(f"Server HMAC verification failed: {e}")
+                logger.error(f"Server HMAC verification failed: {e}")
                 return False
 
         except Exception as e:
-            print(f"Authentication failed: {e}")
+            logger.error(f"Authentication failed: {e}")
             self.client.settimeout(None)  # Reset timeout
             return False
 
     def list(self):
+        if not self.authenticated:
+            print("Not authenticated. Please sign in first.")
+            return
+            
         try:
             message = {'type': "list"}
             self.client.sendto(json.dumps(message).encode(self.FORMAT), self.ADDR)
+            logger.info("Sent list request to server")
         except Exception as e:
-            print("Exception occurred:", e)
+            logger.error(f"Exception sending list command: {e}")
+
+    def discover_peer(self, username):
+    #Request peer information for direct messaging
+        if not self.authenticated:
+            print("Not authenticated. Please sign in first.")
+            return
+        
+        try:
+        # Create peer discovery request
+            message = {
+            'type': "peer_discovery",
+            'request': username,
+            'nonce': time.time()
+            }
+        
+        # Send encrypted request to server
+            self._send_encrypted_message(message)
+            logger.info(f"Sent peer discovery request for {username}")
+        
+        except Exception as e:
+            logger.error(f"Exception during peer discovery: {e}")
 
     def send(self, send_to, msg):
+        if not self.authenticated:
+            print("Not authenticated. Please sign in first.")
+            return
+            
         try:
-            if send_to not in self.peer_keys:
-                print(f"No session key with {send_to}. Establishing...")
-                self.establish_session_key(send_to)
-                return  # Wait for key to establish
-
-            # Encrypt the message (placeholder for now)
-            session_key = self.peer_keys[send_to]
-            encrypted_msg = msg  # TODO: Replace with AES-GCM encryption
-
-            # Send directly to peer
-            if send_to in self.peer_addresses:
-                peer_addr = self.peer_addresses[send_to]
-                message = {
-                    'type': "p2p",
-                    'from': self.username,
-                    'message': encrypted_msg
-                }
-                self.client.sendto(json.dumps(message).encode(self.FORMAT), peer_addr)
-            else:
-                print(f"No address info for {send_to}. Unable to send.")
+            # Increment message counter (serves as an additional nonce)
+            self.message_counter += 1
+            
+            # Generate nonce to prevent replay attacks
+            nonce = time.time()
+            
+            # Create message object as in slide 3
+            message = {
+                'type': "send",
+                'to': send_to,
+                'message': msg,
+                'nonce': nonce,
+                'seq': self.message_counter  # Additional sequence number
+            }
+            
+            # Add HMAC for message authenticity
+            h = hmac.HMAC(self.auth_key, hashes.SHA256())
+            h.update(f"{msg}|{nonce}".encode())
+            message['hmac'] = h.finalize().hex()
+            
+            # Send encrypted message
+            self._send_encrypted_message(message)
+            logger.info(f"Sent encrypted message to {send_to}")
+            
         except Exception as e:
-            print("Exception occurred during send:", e)
+            logger.error(f"Exception sending message: {e}")
 
-    def establish_session_key(self, peer_username):
-        # Step 1: Request peer's contact details from server
-        request = {
-            'type': 'send',
-            'to': peer_username,
-            'from': self.username,
-            'message': '[KEY_REQUEST]'
-        }
-        self.client.sendto(json.dumps(request).encode(self.FORMAT), self.ADDR)
-        # Step 2: Wait for peer info from server (will be handled in receive_from)
+    def _send_encrypted_message(self, message_data):
+        """Encrypt and send a message to the server"""
+        try:
+            # Add HMAC if not already present
+            if 'hmac' not in message_data:
+                h = hmac.HMAC(self.auth_key, hashes.SHA256())
+                h.update(json.dumps(message_data, sort_keys=True).encode(self.FORMAT))
+                message_data['hmac'] = h.finalize().hex()
+            
+            # Convert message to JSON
+            plaintext = json.dumps(message_data).encode(self.FORMAT)
+            
+            # Generate random IV (must be unique for each message)
+            iv = os.urandom(12)
+            
+            # Encrypt message
+            aesgcm = AESGCM(self.session_key)
+            ciphertext = aesgcm.encrypt(iv, plaintext, None)
+            
+            # Send IV + ciphertext
+            encrypted_message = iv + ciphertext
+            self.client.sendto(encrypted_message, self.ADDR)
+                             
+        except Exception as e:
+            logger.error(f"Error encrypting message: {e}")
 
     def receive_from(self):
         while self.running:
             try:
+            # Skip reception if not authenticated
                 if not self.authenticated and self.running:
-        
-                    import time
                     time.sleep(0.1)
                     continue
-                    
-                # Normal message reception after authentication
+                
+            # Normal message reception after authentication
                 self.client.settimeout(1.0)  # Short timeout to allow checking running flag
                 data, addr = self.client.recvfrom(65535)
-                message = json.loads(data.decode())
-                
-                # Handle server shutdown message
-                if message.get('type') == "SERVER_SHUTDOWN":
-                    print("Server has shut down. Exiting...")
-                    self.running = False
-                    break
-                
-                # Handle list response
-                if message.get('type') == 'list_response' and message.get('users'):
-                    print("Online users:", ", ".join(message['users']))
-                    
-                # Handle error messages
-                elif message.get('type') == 'error':
-                    print(f"Error: {message.get('message')}")
-
-                # Handle key exchange initiation
-                elif message.get('type') == 'key_request':
-                    self.handle_key_request(message, addr)
             
-                # Handle key exchange response
-                elif message.get('type') == 'key_response':
-                    self.handle_key_response(message, addr)
-            
-                # Handle encrypted P2P messages
-                elif message.get('type') == 'encrypted_message':
-                    self.handle_encrypted_message(message)
-            
-                # Handle other messages
+            # Check if it's a raw JSON message or encrypted
+                if len(data) > 0 and data[0] == 123:  # 123 is ASCII '{' - start of JSON
+                    try:
+                    # Try to parse as JSON first (for error messages or initial auth)
+                        message = json.loads(data.decode())
+                        self._handle_json_message(message)
+                    except json.JSONDecodeError:
+                    # If not JSON, assume it's encrypted
+                        self._handle_encrypted_message(data)
                 else:
-                    print(f"Received message: {message}")
-
-            except json.JSONDecodeError:
-                print("Received invalid JSON data")
+                # Directly handle as encrypted without trying to decode as UTF-8
+                    self._handle_encrypted_message(data)
+            
             except socket.timeout:
                 pass
             except Exception as e:
                 if self.running:
-                    print(f"Error in receive thread: {e}")
+                    logger.error(f"Error in receive thread: {e}")
+
+
+    def _handle_json_message(self, message):
+        """Handle unencrypted JSON messages"""
+        # Handle error messages
+        if message.get('type') == 'error':
+            print(f"Error: {message.get('message')}")
+        elif message.get('type') == 'logout_ack':
+            logger.info("Received logout acknowledgment")
+            self.running = False
+            
+    def _handle_encrypted_message(self, data):
+        """Handle and decrypt encrypted messages"""
+        try:
+            # Format: IV (12 bytes) + Ciphertext + Auth Tag
+            iv = data[:12]
+            ciphertext = data[12:]
+            
+            # Decrypt using session key
+            aesgcm = AESGCM(self.session_key)
+            plaintext = aesgcm.decrypt(iv, ciphertext, None)
+            
+            # Parse decrypted message
+            message = json.loads(plaintext.decode(self.FORMAT))
+            
+            # Verify HMAC if present
+            if 'hmac' in message:
+                msg_hmac = bytes.fromhex(message.pop('hmac'))
+                msg_content = json.dumps(message, sort_keys=True).encode(self.FORMAT)
+                h = hmac.HMAC(self.auth_key, hashes.SHA256())
+                h.update(msg_content)
+                try:
+                    h.verify(msg_hmac)
+                except Exception:
+                    logger.warning("HMAC verification failed")
+                    return
+            
+            # Handle based on message type
+            if message.get('type') == 'SERVER_SHUTDOWN':
+                print("Server has shut down. Exiting...")
+                self.running = False
+                
+            elif message.get('type') == 'list_response' and message.get('users'):
+                print("Online users:", ", ".join(message['users']))
+                
+            elif message.get('type') == 'message' and message.get('from') and message.get('message'):
+                print(f"Message from {message['from']}: {message['message']}")
+                
+            elif message.get('type') == 'delivery_confirmation':
+                print(f"Message to {message.get('to')} was {message.get('status')}")
+                
+            elif message.get('type') == 'peer_info':
+                # Store peer connection info
+                ip = message.get('ip')
+                port = message.get('port')
+                if ip and port:
+                    print(f"Received peer information: {ip}:{port}")
+                    self.peer_connections[message.get('user')] = (ip, port)
+                
+            elif message.get('type') == 'error':
+                print(f"Error: {message.get('message')}")
+                
+            else:
+                logger.warning(f"Received unknown message type: {message.get('type', 'unknown')}")
+                
+        except Exception as e:
+            logger.error(f"Error decrypting message: {e}")
 
     def handle_key_request(self, message, addr):
         """Handle incoming key exchange request"""
@@ -419,23 +554,64 @@ class Client:
         return aesgcm.decrypt(nonce, ciphertext, None).decode()
 
     def disconnect(self):
-        if self.running:
+        if not self.authenticated or not self.running:
+            self.running = False
+            self.client.close()
+            return
+            
+        try:
+            # Generate HMAC for logout message
+            h = hmac.HMAC(self.auth_key, hashes.SHA256())
+            h.update(b"Logout")
+            logout_hmac = h.finalize().hex()
+            
+            # Create logout message with HMAC
+            logout_msg = {
+                'type': "logout",
+                'hmac': logout_hmac
+            }
+            
+            # Send logout request
+            self.client.sendto(json.dumps(logout_msg).encode(self.FORMAT), self.ADDR)
+            logger.info("Sent authenticated logout request to server")
+            
+            # Wait for server ACK
             try:
-                message = {'type': "disconnect", 'username': self.username}
-                self.client.sendto(json.dumps(message).encode(self.FORMAT), self.ADDR)
+                self.client.settimeout(5.0)
+                data, addr = self.client.recvfrom(65535)
+                ack_msg = json.loads(data.decode())
+                
+                if ack_msg.get('type') == 'logout_ack' and 'hmac' in ack_msg:
+                    # Verify server HMAC
+                    server_hmac = bytes.fromhex(ack_msg['hmac'])
+                    h = hmac.HMAC(self.auth_key, hashes.SHA256())
+                    h.update(b"ACK")
+                    h.verify(server_hmac)
+                    logger.info("Server logout acknowledged")
+                else:
+                    logger.warning("Invalid logout acknowledgment from server")
+                    
             except Exception as e:
-                print("Exception occurred:", e)
-            finally:
-                self.running = False
-                self.client.close()
-                print("Disconnected from server")
+                logger.warning(f"Error receiving logout acknowledgment: {e}")
+                
+        except Exception as e:
+            logger.error(f"Exception during logout: {e}")
+        finally:
+            # Delete all session keys for PFS as shown in Image 3
+            self.session_key = None
+            self.auth_key = None
+            self.authenticated = False
+            self.running = False
+            self.client.close()
+            print("Disconnected from server")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Put the server details')
-    parser.add_argument("-u", type=str, help="Client Username", required=True)
-    parser.add_argument("-sip", type=str, help="Server IP address", required=True)
-    parser.add_argument("-sp", type=int, help="Server Port", required=True)
-    parser.add_argument("-p", type=str, help="Password", required=True)
+    parser = argparse.ArgumentParser(description='Secure UDP Chat Client')
+    parser.add_argument("-u", "--username", type=str, help="Client Username", required=True)
+    parser.add_argument("-sip", "--server-ip", type=str, help="Server IP address", required=True)
+    parser.add_argument("-sp", "--server-port", type=int, help="Server Port", required=True)
+    parser.add_argument("-p", "--password", type=str, help="Password", required=True)
     args = parser.parse_args()
-    client_obj = Client(args.sp, args.sip, args.u, args.p)
+    
+    client_obj = SecureClient(args.server_port, args.server_ip, args.username, args.password)
     client_obj.run()
