@@ -20,7 +20,6 @@ class Server:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server.bind(self.ADDR)
         self.running = True
-        self.key_exchange_attempts = {}
 
     def users(self):
         users = [
@@ -53,8 +52,6 @@ class Server:
                     self.case_send(message)
                 elif message['type'] == "disconnect":
                     self.case_disconnect(addr, message)
-                elif message['type'] == "key_forward":
-                    self.handle_key_forward(message)
             except Exception as e:
                 print(f"Error processing message: {e}")
 
@@ -163,91 +160,30 @@ class Server:
 
     def case_send(self, message):
         try:
-            to_user = message['to']
-            from_user = message['from']
-        
-            # Only forward key exchange messages
-            if message.get('message') in ('[KEY_REQUEST]', '[KEY_RESPONSE]'):
-                if to_user in self.clients:
-                    forward_msg = {
-                        'type': 'key_forward',
-                        'from': from_user,
-                        'message': message['message']
-                    }
-                    if 'public_key' in message:
-                        forward_msg['public_key'] = message['public_key']
-                    if 'timestamp' in message:
-                        forward_msg['timestamp'] = message['timestamp']
-                
-                    self.server.sendto(
-                        json.dumps(forward_msg).encode(),
-                        (self.clients[to_user]['actual_address'],
-                         self.clients[to_user]['actual_port'])
-                    )
-                else:
-                    error_msg = {
-                        'type': 'error',
-                        'message': f'User {to_user} not online'
-                    }
-                    self.server.sendto(
-                        json.dumps(error_msg).encode(),
-                        (self.clients[from_user]['actual_address'],
-                         self.clients[from_user]['actual_port'])
-                    )
-            else:
-                # Regular messages should be sent directly P2P
-                error_msg = {
-                    'type': 'error',
-                    'message': 'Server only forwards key exchange messages'
-                }
-                self.server.sendto(
-                    json.dumps(error_msg).encode(),
-                    (self.clients[from_user]['actual_address'],
-                     self.clients[from_user]['actual_port'])
-                )
-
-          
-        except Exception as e:
-            print(f"Error forwarding message: {e}")
-
-    def handle_key_forward(self, message):
-        """Handle forwarded key exchange messages"""
-        try:
-            to_user = message['to']
-            from_user = message['from']
-        
-            if to_user in self.clients:
-                # Forward the message with original sender info
-                forward_msg = {
-                    'type': 'key_exchange',
-                    'from': from_user,
-                    'message': message['message']
-                }   
-                if 'public_key' in message:
-                    forward_msg['public_key'] = message['public_key']
-                if 'timestamp' in message:
-                    forward_msg['timestamp'] = message['timestamp']
-                
-                self.server.sendto(
-                    json.dumps(forward_msg).encode(),
-                    (self.clients[to_user]['actual_address'],
-                     self.clients[to_user]['actual_port'])
-                )
-            # Add to handle_key_forward:
-            if from_user not in self.key_exchange_attempts:
-                self.key_exchange_attempts[from_user] = 0
-            self.key_exchange_attempts[from_user] += 1
-
-            if self.key_exchange_attempts[from_user] > 5:  # Limit to 5 attempts/min
-                error_msg = {
-                    'type': 'error',
-                    'message': 'Key exchange rate limit exceeded'
-                }
-                self.server.sendto(json.dumps(error_msg).encode(), addr)
-                return
+            to_username = message['to']
+            from_username = message['from']
             
+            if to_username not in self.clients:
+                error_response = {
+                    'type': 'error',
+                    'message': f"User {to_username} is not online"
+                }
+                self.server.sendto(json.dumps(error_response).encode(), 
+                                  (self.clients[from_username]['actual_address'],
+                                   self.clients[from_username]['actual_port']))
+                return
+                
+            forward_message = {
+                'type': 'message',
+                'from': from_username,
+                'message': message['message']
+            }
+            
+            self.server.sendto(json.dumps(forward_message).encode(),
+                              (self.clients[to_username]['actual_address'],
+                               self.clients[to_username]['actual_port']))
         except Exception as e:
-            print(f"Error handling key forward: {e}")
+            print(f"Error sending message: {e}")
 
     def case_disconnect(self, addr, message):
         try:
