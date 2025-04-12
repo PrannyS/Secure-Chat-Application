@@ -530,7 +530,7 @@ if __name__ == '__main__':
         server.shutdown()
     
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTSTP, signal_handler)
+#    signal.signal(signal.SIGTSTP, signal_handler)
     
     try:
         server.start()
