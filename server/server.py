@@ -15,17 +15,20 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from argon2 import low_level
 import logging
 
-# Set up logging
+# Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('SecureChatServer')
+
 
 class SecureServer:
     clients = {}
     FORMAT = 'utf-8'
     SERVER_ADDR = socket.gethostbyname(socket.gethostname())
     SESSION_TIMEOUT = 3600  # 1 hour session timeout
-    # Predefined generator for DH key exchange
-    G = ec.SECP384R1()
+
+    
+    G = ec.SECP384R1() # Elliptic curve used for key exchange
+
 
     def __init__(self, port, users_file=None):
         self.port = port
@@ -34,13 +37,15 @@ class SecureServer:
         self.server.bind(self.ADDR)
         self.running = True
         self.users_file = users_file
-        self.server_private = ec.generate_private_key(self.G)
-        self.server_public = self.server_private.public_key()
+        self.server_private = ec.generate_private_key(self.G) # This is the ephemeral private key for the server
+        self.server_public = self.server_private.public_key() # This is the ephemeral public key for the server
         
         # Start session cleanup thread
         self.cleanup_thread = threading.Thread(target=self._cleanup_expired_sessions)
         self.cleanup_thread.daemon = True
         self.cleanup_thread.start()
+
+
 
     def load_users(self):
         """Load user credentials from file or use defaults if file not provided"""
@@ -62,29 +67,36 @@ class SecureServer:
                 "name": "Bob",
                 "salt": "5ef85ffbc8b7154eb611a6148b341b13",
                 "verifier": "1760564b9de826d341b2457d8a5d32ee47af272a189c7d41875df78464626250"
+            },
+            {
+                "name": "Charlie",
+                "salt": "378cb817bf8ebde3d89ad8351af36331",
+                "verifier": "88fafecaef7ae2ec21bb3aaf77bb3bf8d5385dd99378ff65e5cf41b612f89a52"
             }
         ]
         return users
+
 
     def start(self):
         logger.info(f"Server Initialized on {self.ADDR}")
         while self.running:
             try:
                 data, addr = self.server.recvfrom(65535)
-            # First byte check - 123 is ASCII '{' (start of JSON)
-                if len(data) > 0 and data[0] == 123:
+                
+                if len(data) > 0 and data[0] == 123: # JSON starts with a '{', so this checks whether the first byte is a JSON character
                     try:
-                    # Try to decode as JSON first
+                        # Decoding the received message as JSON 
                         message = json.loads(data.decode(self.FORMAT))
                         self._process_json_message(message, addr)
                     except json.JSONDecodeError:
-                    # If JSON parsing fails, try as encrypted
+                        # Decoding the received as an encrytped message
                         self._process_encrypted_message(data, addr)
                 else:
-                # Directly process as encrypted message
+                    # Default to encrypted message processing
                     self._process_encrypted_message(data, addr)
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
+
 
     def _process_json_message(self, message, addr):
         """Process unencrypted JSON messages (authentication, etc.)"""
@@ -99,9 +111,10 @@ class SecureServer:
         else:
             logger.warning(f"Unknown message type: {msg_type}")
 
+
     def _process_encrypted_message(self, data, addr):
-    #"""Process encrypted binary messages"""
-    # Find sender by address
+        """Process encrypted binary messages"""
+        # Find sender by address
         sender = None
         for username, client_info in self.clients.items():
             if (client_info['actual_address'], client_info['actual_port']) == addr:
@@ -113,39 +126,37 @@ class SecureServer:
             return
         
         try:
-        # Format: IV (12 bytes) + Ciphertext + Auth Tag
+            # Format: IV (12 bytes) + Ciphertext + Auth Tag
             iv = data[:12]
             ciphertext = data[12:]
         
-        # Decrypt using stored session key
+            # Decrypt using stored session key
             session_key = self.clients[sender]['session_key']
             aesgcm = AESGCM(session_key)
             plaintext = aesgcm.decrypt(iv, ciphertext, None)
         
-        # Parse decrypted message
+            # Parse decrypted message
             decrypted_msg = json.loads(plaintext.decode(self.FORMAT))
         
-        # Log decrypted message content for debugging
+            # Log decrypted message content for debugging
             logger.debug(f"Decrypted message from {sender}: {json.dumps(decrypted_msg)}")
         
-        # Verify HMAC
+            # Verify HMAC
             if 'hmac' in decrypted_msg:
                 msg_hmac = bytes.fromhex(decrypted_msg.pop('hmac'))
-            # Important: Sort keys for consistent ordering
+                # Important: Sort keys for consistent ordering
                 msg_content = json.dumps(decrypted_msg, sort_keys=True).encode(self.FORMAT)
                 h = hmac.HMAC(self.clients[sender]['auth_key'], hashes.SHA256())
                 h.update(msg_content)
-            try:
-                h.verify(msg_hmac)
-                logger.debug(f"HMAC verification succeeded for message from {sender}")
-            except Exception as e:
-                logger.warning(f"HMAC verification failed for message from {sender}: {e}")
-                # For debugging, calculate what the HMAC should be
-                correct_hmac = h.finalize().hex()
-                logger.debug(f"Expected HMAC: {correct_hmac}")
-                return
-        
-        # Rest of the function...
+                try:
+                    h.verify(msg_hmac)
+                    logger.debug(f"HMAC verification succeeded for message from {sender}")
+                except Exception as e:
+                    logger.warning(f"HMAC verification failed for message from {sender}: {e}")
+                    # For debugging, calculate what the HMAC should be
+                    correct_hmac = h.finalize().hex()
+                    logger.debug(f"Expected HMAC: {correct_hmac}")
+                    return
             
             # Check nonce to prevent replay attacks
             if 'nonce' in decrypted_msg:
@@ -176,7 +187,7 @@ class SecureServer:
         user = next((u for u in users if u['name'] == username), None)
         
         if not user:
-            logger.warning(f"Invalid username {username}")
+            logger.warning(f" An invalid user with username [{username}] tried to sign in from IP {addr[0]}:{addr[1]}")
             return
 
         try:
@@ -295,9 +306,8 @@ class SecureServer:
             self.server.sendto(error_msg, addr)
 
     def case_peer_discovery(self, sender, message):
-        """Handle peer discovery requests as shown in slide 2"""
         try:
-            # Get requested user's IP and port
+        # Get requested user's IP and port
             request = message.get('request')
             
             if not request or request not in self.clients:
@@ -309,19 +319,25 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
                 
-            # Create response with IP, Port and HMAC as in slide
+            # Create response with IP, Port
             target_client = self.clients[request]
             response = {
                 'type': 'peer_info',
+                'user': request,
                 'ip': target_client['actual_address'],
                 'port': target_client['actual_port'],
                 'nonce': time.time()
             }
             
-            # Add HMAC of IP|Port as shown in slide
+            # Calculate HMAC specifically for IP and port, matching client's verification
+            ip_port_string = f"{target_client['actual_address']}|{target_client['actual_port']}"
             h = hmac.HMAC(self.clients[sender]['auth_key'], hashes.SHA256())
-            h.update(f"{target_client['actual_address']}|{target_client['actual_port']}".encode())
+            h.update(ip_port_string.encode(self.FORMAT))
             response['hmac'] = h.finalize().hex()
+            
+            # Log the HMAC calculation for debugging
+            logger.debug(f"Calculating HMAC for: {ip_port_string}")
+            logger.debug(f"HMAC for peer_info: {response['hmac']}")
             
             # Send encrypted response
             self._send_encrypted_message(sender, response)
@@ -525,13 +541,7 @@ if __name__ == '__main__':
     
     server = SecureServer(args.server_port, args.users_file)
     
-    def signal_handler(signum, frame):
-        print("\nShutting down server...")
-        server.shutdown()
-    
-    signal.signal(signal.SIGINT, signal_handler)
-#    signal.signal(signal.SIGTSTP, signal_handler)
-    
+
     try:
         server.start()
     except KeyboardInterrupt:
