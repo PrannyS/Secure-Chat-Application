@@ -44,6 +44,10 @@ class SecureServer:
         self.cleanup_thread.daemon = True
         self.cleanup_thread.start()
 
+        self.connection_attempts = {}  
+        self.RATE_LIMIT = 5  
+        self.RATE_WINDOW = 10  
+
 
     def load_users(self):
 
@@ -97,6 +101,19 @@ class SecureServer:
 
 
     def _process_json_message(self, message, addr):
+        ip = addr[0]
+        current_time = time.time()
+        
+        self.connection_attempts = {k:v for k,v in self.connection_attempts.items() 
+                                  if current_time - v['last_seen'] < self.RATE_WINDOW}
+        
+        if ip not in self.connection_attempts:
+            self.connection_attempts[ip] = {'count':1, 'last_seen':current_time}
+        else:
+            self.connection_attempts[ip]['count'] +=1
+            if self.connection_attempts[ip]['count'] > self.RATE_LIMIT:
+                logger.warning(f"Rate limit exceeded for {ip}")
+                return 
         msg_type = message.get('type')
         
         if msg_type == "SIGN-IN":
