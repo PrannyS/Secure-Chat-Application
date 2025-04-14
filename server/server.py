@@ -54,7 +54,7 @@ class SecureServer:
             except Exception as e:
                 logger.error(f"Error loading users file: {e}")
         
-        # Default users if no file provided or file not found
+        # Default users if no file provided or file does not exist
         users = [
             {
                 "name": "Alice",
@@ -147,13 +147,11 @@ class SecureServer:
                 if nonce <= self.clients[sender].get('last_nonce', 0):
                     logger.warning(f"Possible replay attack detected from {sender}")
                     return
-                # Update nonce
+
                 self.clients[sender]['last_nonce'] = nonce
-            
-            # Update last activity time
+
             self.clients[sender]['last_activity'] = time.time()
             
-            # Process message based on type
             if decrypted_msg.get('type') == "send":
                 self.case_send(sender, decrypted_msg)
             elif decrypted_msg.get('type') == "peer_discovery":
@@ -368,7 +366,6 @@ class SecureServer:
             to_username = message['to']
             
             if to_username not in self.clients:
-                # Send error back to sender
                 error_response = {
                     'type': 'error',
                     'message': f"User {to_username} is not online",
@@ -377,12 +374,9 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
             
-            # Create message object as in slide 3 (C, Nonce, HMAC)
-            # Here C is the encrypted message
             ciphertext = message['message']
             nonce = time.time()
             
-            # Forward the message to recipient
             forward_message = {
                 'type': 'message',
                 'from': sender,
@@ -390,15 +384,12 @@ class SecureServer:
                 'nonce': nonce
             }
             
-            # Add HMAC
             h = hmac.HMAC(self.clients[to_username]['auth_key'], hashes.SHA256())
             h.update(f"{ciphertext}|{nonce}".encode())
             forward_message['hmac'] = h.finalize().hex()
             
-            # Encrypt the message for recipient
             self._send_encrypted_message(to_username, forward_message)
             
-            # Send delivery confirmation to sender
             confirm_message = {
                 'type': 'delivery_confirmation',
                 'to': to_username,
@@ -477,7 +468,6 @@ class SecureServer:
 
     def case_logout(self, addr, message):
         try:
-            # Find username by address
             username = None
             for user, info in self.clients.items():
                 if (info['actual_address'], info['actual_port']) == (addr[0], addr[1]):
@@ -488,7 +478,6 @@ class SecureServer:
                 logger.warning(f"Logout request from unknown client {addr}")
                 return
                 
-            # Verify the HMAC if present
             if 'hmac' in message:
                 hmac_value = bytes.fromhex(message['hmac'])
                 h = hmac.HMAC(self.clients[username]['auth_key'], hashes.SHA256())
@@ -499,7 +488,6 @@ class SecureServer:
                     logger.warning(f"Invalid logout HMAC from {username}")
                     return
             
-            # Send ACK with HMAC as shown in slide 3
             h = hmac.HMAC(self.clients[username]['auth_key'], hashes.SHA256())
             h.update(b"ACK")
             ack_msg = {
@@ -508,7 +496,6 @@ class SecureServer:
             }
             self.server.sendto(json.dumps(ack_msg).encode(), addr)
             
-            # For PFS (Perfect Forward Secrecy), remove all session keys
             logger.info(f"{username} logged out, removing session keys for PFS")
             del self.clients[username]
             
@@ -517,18 +504,16 @@ class SecureServer:
 
 
     def _cleanup_expired_sessions(self):
-        """Periodically clean up expired sessions"""
+        # To remove expired sessions after 60 mins
         while self.running:
-            time.sleep(60)  # Check every minute
+            time.sleep(60)  
             current_time = time.time()
             expired_users = []
             
             for username, info in self.clients.items():
-                # Check if session has been inactive for too long
                 if current_time - info['last_activity'] > self.SESSION_TIMEOUT:
                     expired_users.append(username)
             
-            # Remove expired sessions
             for username in expired_users:
                 logger.info(f"Session expired for {username}")
                 del self.clients[username]
@@ -548,8 +533,6 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
             
-            # Verify signature of exchange data
-            # For this implementation, we'll use HMAC with sender's auth key
             sig = exchange_data.get('signature')
             
             if not sig:
@@ -561,7 +544,6 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
             
-            # Verify signature based on the content
             data_to_verify = f"{exchange_data.get('public_key', '')}|{exchange_data.get('nonce', '')}|{exchange_data.get('to', '')}"
             h = hmac.HMAC(self.clients[sender]['auth_key'], hashes.SHA256())
             h.update(data_to_verify.encode())
@@ -569,10 +551,8 @@ class SecureServer:
             try:
                 h.verify(bytes.fromhex(sig))
                 
-                # Add server verification flag
                 exchange_data['server_verified'] = True
                 
-                # Forward to the peer
                 forward_msg = {
                     'type': 'key_exchange',
                     'data': exchange_data
@@ -595,7 +575,6 @@ class SecureServer:
     
 
     def case_verify_key_exchange(self, sender, message):
-        """Handle verify_key_exchange requests from client"""
         try:
             exchange_data = message.get('exchange_data')
             if not exchange_data:
@@ -607,7 +586,6 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
                 
-            # Get the sender of the original key exchange
             original_sender = exchange_data.get('from')
             if not original_sender or original_sender not in self.clients:
                 error_response = {
@@ -618,7 +596,6 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
             
-            # Verify signature
             signature = exchange_data.get('signature')
             if not signature:
                 error_response = {
@@ -629,7 +606,6 @@ class SecureServer:
                 self._send_encrypted_message(sender, error_response)
                 return
                 
-            # Reconstruct the data that was signed
             public_key = exchange_data.get('public_key')
             nonce = exchange_data.get('nonce')
             recipient = exchange_data.get('to')
@@ -650,7 +626,6 @@ class SecureServer:
             try:
                 h.verify(bytes.fromhex(signature))
                 
-                # Send verification success response
                 response = {
                     'type': 'key_exchange_verification',
                     'status': 'verified',
@@ -684,7 +659,6 @@ class SecureServer:
         self.running = False
         for username in list(self.clients.keys()):
             try:
-                # Send shutdown notice
                 shutdown_msg = {
                     'type': 'SERVER_SHUTDOWN',
                     'nonce': time.time()

@@ -42,7 +42,7 @@ class SecureClient:
         self.session_key = None
         self.auth_key = None
         self.message_counter = 0
-        self.peer_connections = {}  # For direct peer connections
+        self.peer_connections = {}  
         self.peer_keys = {}         # Stores session keys per peer
         self.peer_addresses = {}    # Stores actual address/port of peers
         self.ephemeral_private_keys = {}  # Store ephemeral private keys per peer
@@ -271,19 +271,15 @@ class SecureClient:
 
 
     def send(self, send_to, msg):
-        """Send message via server relay"""
         if not self.authenticated:
             print("Not authenticated. Please sign in first.")
             return
             
         try:
-            # Increment message counter (serves as an additional nonce)
             self.message_counter += 1
             
-            # Generate nonce to prevent replay attacks
             nonce = time.time()
             
-            # Create message object
             message = {
                 'type': "send",
                 'to': send_to,
@@ -292,12 +288,10 @@ class SecureClient:
                 'seq': self.message_counter  # Additional sequence number
             }
             
-            # Add HMAC for message authenticity
             h = hmac.HMAC(self.auth_key, hashes.SHA256())
             h.update(f"{msg}|{nonce}".encode())
             message['hmac'] = h.finalize().hex()
             
-            # Send encrypted message
             self._send_encrypted_message(message)
             logger.info(f"Sent encrypted message to {send_to} via server")
             
@@ -356,16 +350,14 @@ class SecureClient:
 
 
     def _handle_json_message(self, message, addr):
-        """Handle unencrypted JSON messages"""
         msg_type = message.get('type')
         
-        # Handle error messages
         if msg_type == 'error':
             print(f"Error: {message.get('message')}")
         elif msg_type == 'logout_ack':
             logger.info("Received logout acknowledgment")
             self.running = False
-        # Handle P2P key exchange messages
+
         elif msg_type == 'key_request':
             self.handle_key_request(message, addr)
         elif msg_type == 'key_response':
@@ -373,14 +365,13 @@ class SecureClient:
         elif msg_type == 'encrypted_message':
             self.handle_encrypted_p2p_message(message, addr)
         elif msg_type == 'key_exchange':
-            # Handle direct key exchange messages from peers
+
             self.handle_key_exchange(message, addr)
         else:
             logger.warning(f"Received unknown message type: {msg_type}")
 
 
     def handle_key_exchange(self, message, addr):
-        """Handle direct key exchange messages from peers"""
         sender = message.get('from')
         if not sender:
             logger.warning("Received key exchange without sender information")
@@ -389,13 +380,11 @@ class SecureClient:
         print(f"Received key exchange from {sender}")
         
         try:
-            # Load the peer's public key
             if 'public_key' in message:
                 peer_pubkey = serialization.load_pem_public_key(
                     message['public_key'].encode()
                 )
                 
-                # Generate ephemeral key pair if we haven't already
                 if sender not in self.ephemeral_private_keys:
                     private_key = ec.generate_private_key(self.G)
                     self.ephemeral_private_keys[sender] = private_key
@@ -404,13 +393,11 @@ class SecureClient:
                 
                 public_key = private_key.public_key()
                 
-                # Perform ECDH key exchange
                 shared_secret = private_key.exchange(
                     ec.ECDH(),
                     peer_pubkey
                 )
                 
-                # Use nonce from exchange for consistent key derivation
                 timestamp = str(message.get('timestamp', int(time.time()))).encode()
                 hkdf = HKDF(
                     algorithm=hashes.SHA256(),
@@ -421,11 +408,9 @@ class SecureClient:
                 )
                 session_key = hkdf.derive(shared_secret)
                 
-                # Store session key and peer address
                 self.peer_keys[sender] = session_key
                 self.peer_addresses[sender] = addr
                 
-                # Send a response with our public key
                 response = {
                     'type': 'key_response',
                     'from': self.username,
@@ -452,20 +437,17 @@ class SecureClient:
 
 
     def handle_relayed_key_exchange(self, message, addr):
-        """Handle key exchange messages relayed from server"""
         exchange_data = message.get('data', {})
         
         if exchange_data.get('server_verified') and exchange_data.get('from') and exchange_data.get('public_key'):
             sender = exchange_data.get('from')
             print(f"Received verified key exchange from {sender}")
             
-            # Load the peer's public key
             try:
                 peer_pubkey = serialization.load_pem_public_key(
                     exchange_data.get('public_key').encode()
                 )
                 
-                # Generate ephemeral key pair if we haven't already
                 if sender not in self.ephemeral_private_keys:
                     private_key = ec.generate_private_key(self.G)
                     self.ephemeral_private_keys[sender] = private_key
@@ -474,13 +456,11 @@ class SecureClient:
                 
                 public_key = private_key.public_key()
                 
-                # Perform ECDH key exchange
                 shared_secret = private_key.exchange(
                     ec.ECDH(),
                     peer_pubkey
                 )
                 
-                # Use nonce from exchange for consistent key derivation
                 nonce = exchange_data.get('nonce', '').encode()
                 hkdf = HKDF(
                     algorithm=hashes.SHA256(),
@@ -491,11 +471,8 @@ class SecureClient:
                 )
                 session_key = hkdf.derive(shared_secret)
                 
-                # Store session key
                 self.peer_keys[sender] = session_key
                 
-                # Send our public key in response if we haven't already
-                # Request verification from server
                 self._send_encrypted_message({
                     'type': 'verify_key_exchange',
                     'exchange_data': exchange_data
@@ -523,16 +500,12 @@ class SecureClient:
             if 'hmac' in message:
                 msg_hmac = bytes.fromhex(message.pop('hmac'))
                 
-                # Special handling for peer_info type messages
                 if message.get('type') == 'peer_info':
-                    # For peer_info, HMAC is calculated specifically on ip|port
                     ip = message.get('ip')
                     port = message.get('port')
                     h = hmac.HMAC(self.auth_key, hashes.SHA256())
                     h.update(f"{ip}|{port}".encode(self.FORMAT))
                 else:
-                    # For other message types, HMAC is calculated on the entire message
-                    # First remove hmac from the verification message
                     verification_msg = message_for_verification.copy()
                     verification_msg.pop('hmac')
                     msg_content = json.dumps(verification_msg, sort_keys=True).encode(self.FORMAT)
@@ -544,9 +517,7 @@ class SecureClient:
                     logger.debug("HMAC verification successful")
                 except Exception as e:
                     logger.warning(f"HMAC verification failed: {e}")
-                    # For debugging only - in production you should return here to reject invalid messages
                     logger.warning("Continuing despite HMAC failure - FOR DEBUGGING ONLY")
-                    # return  # Uncomment this in production
             
             if message.get('type') == 'SERVER_SHUTDOWN':
                 print("Server has shut down. Exiting...")
@@ -602,7 +573,7 @@ class SecureClient:
             
         print(f"Key exchange request from {sender}")
 
-        # Generate ephemeral key pair for this peer if needed
+        # Generate ephemeral key pair for the peer
         if sender not in self.ephemeral_private_keys:
             private_key = ec.generate_private_key(self.G)
             self.ephemeral_private_keys[sender] = private_key
@@ -611,23 +582,19 @@ class SecureClient:
             
         public_key = private_key.public_key()
 
-        # Store peer address
         self.peer_addresses[sender] = addr
 
-        # Get peer's public key if available in the request
         if 'public_key' in message:
             try:
                 peer_pubkey = serialization.load_pem_public_key(
                     message['public_key'].encode()
                 )
                 
-                # Perform ECDH key exchange
                 shared_secret = private_key.exchange(
                     ec.ECDH(),
                     peer_pubkey
                 )
                 
-                # Use original timestamp from the request for consistent key derivation
                 timestamp = str(message.get('timestamp', int(time.time()))).encode()
                 hkdf = HKDF(
                     algorithm=hashes.SHA256(),
@@ -637,14 +604,12 @@ class SecureClient:
                     backend=default_backend()
                 )
                 session_key = hkdf.derive(shared_secret)
-                
-                # Store session key
+
                 self.peer_keys[sender] = session_key
                 print(f"Session established with {sender}")
             except Exception as e:
                 logger.error(f"Error processing peer's public key: {e}")
 
-        # Prepare response with public key 
         response = {
             'type': 'key_response',
             'from': self.username,
@@ -655,7 +620,6 @@ class SecureClient:
             'timestamp': message.get('timestamp', int(time.time()))  # Use original timestamp if available
         }
 
-        # Send response directly to peer (P2P)
         try:
             self.client.sendto(
                 json.dumps(response).encode(self.FORMAT),
@@ -667,7 +631,6 @@ class SecureClient:
 
 
     def handle_key_response(self, message, addr):
-        """Handle key exchange response and establish session key"""
         sender = message.get('from')
         if not sender:
             logger.warning("Received key response without sender information")
@@ -676,26 +639,20 @@ class SecureClient:
         print(f"Processing key response from {sender}")
 
         try:
-            # Load peer's public key
             peer_pubkey = serialization.load_pem_public_key(
                 message['public_key'].encode()
             )
 
-            # Generate our ephemeral key if we haven't already
             if sender not in self.ephemeral_private_keys:
                 self.ephemeral_private_keys[sender] = ec.generate_private_key(self.G)
-                # Now we need to send our public key back to complete the exchange
                 self.initiate_key_exchange(sender)
-                return  # Important: Return here and wait for the complete exchange
+                return 
 
-            # Perform ECDH key exchange
             shared_secret = self.ephemeral_private_keys[sender].exchange(
                 ec.ECDH(),
                 peer_pubkey
             )
 
-            # Use a consistent salt for both sides - combine both timestamps
-            # This ensures both peers derive the same key
             our_timestamp = int(time.time())
             peer_timestamp = message.get('timestamp', our_timestamp)
             combined_timestamp = str(min(our_timestamp, peer_timestamp)).encode()
@@ -709,7 +666,6 @@ class SecureClient:
             )
             session_key = hkdf.derive(shared_secret)
 
-            # Store session key and peer address
             self.peer_keys[sender] = session_key
             self.peer_addresses[sender] = addr
 
@@ -720,7 +676,6 @@ class SecureClient:
 
 
     def handle_encrypted_p2p_message(self, message, addr):
-        """Handle encrypted message from peer"""
         sender = message.get('from')
         if not sender:
             logger.warning("Received encrypted message without sender information")
@@ -728,16 +683,13 @@ class SecureClient:
             
         if sender not in self.peer_keys:
             print(f"No session key for {sender}, establishing connection...")
-            # Store their address and initiate key exchange
             self.peer_addresses[sender] = addr
             self.initiate_key_exchange(sender)
             return
     
         try:
-            # Decode the base64 encoded message
             encrypted_msg = base64.b64decode(message['message'])
         
-            # Decrypt using AES-GCM
             decrypted_msg = self.decrypt_message(encrypted_msg, self.peer_keys[sender])
         
             print(f"\n[P2P from {sender}]: {decrypted_msg}")
@@ -800,6 +752,7 @@ class SecureClient:
                 )
                 logger.info(f"Sent direct key exchange request to {peer_username}")
                 print(f"Initiated key exchange with {peer_username}")
+
             else:
                 relay_message = {
                     'type': 'relay_key_exchange',
@@ -816,15 +769,12 @@ class SecureClient:
 
 
     def send_encrypted_message(self, recipient, plaintext):
-        """Send an encrypted message directly to another peer"""
-        # Check if we have the recipient's address
         if recipient not in self.peer_addresses:
             print(f"No address information for {recipient}. Discovering peer...")
             self.discover_peer(recipient)
             print(f"Please try sending message to {recipient} again after peer discovery")
             return
             
-        # Check if we have a session key established
         if recipient not in self.peer_keys:
             print(f"No secure session with {recipient}. Initiating key exchange...")
             self.initiate_key_exchange(recipient)
@@ -832,20 +782,16 @@ class SecureClient:
             return
 
         try:
-            # Encrypt the message
             encrypted_msg = self.encrypt_message(plaintext, self.peer_keys[recipient])
         
-            # Base64 encode for safe transmission
             encoded_msg = base64.b64encode(encrypted_msg).decode()
         
-            # Prepare message
             message = {
                 'type': 'encrypted_message',
                 'from': self.username,
                 'message': encoded_msg
             }
         
-            # Send directly to peer
             self.client.sendto(
                 json.dumps(message).encode(self.FORMAT),
                 self.peer_addresses[recipient]
@@ -856,7 +802,6 @@ class SecureClient:
 
 
     def encrypt_message(self, plaintext, key):
-        """Encrypt message using AES-GCM"""
         aesgcm = AESGCM(key)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
@@ -864,7 +809,6 @@ class SecureClient:
 
 
     def decrypt_message(self, ciphertext, key):
-        """Decrypt message using AES-GCM"""
         aesgcm = AESGCM(key)
         nonce = ciphertext[:12]
         ciphertext = ciphertext[12:]
@@ -878,29 +822,24 @@ class SecureClient:
             return
             
         try:
-            # Generate HMAC for logout message
             h = hmac.HMAC(self.auth_key, hashes.SHA256())
             h.update(b"Logout")
             logout_hmac = h.finalize().hex()
             
-            # Create logout message with HMAC
             logout_msg = {
                 'type': "logout",
                 'hmac': logout_hmac
             }
             
-            # Send logout request
             self.client.sendto(json.dumps(logout_msg).encode(self.FORMAT), self.ADDR)
             logger.info("Sent authenticated logout request to server")
             
-            # Wait for server ACK
             try:
                 self.client.settimeout(5.0)
                 data, addr = self.client.recvfrom(65535)
                 ack_msg = json.loads(data.decode())
                 
                 if ack_msg.get('type') == 'logout_ack' and 'hmac' in ack_msg:
-                    # Verify server HMAC
                     server_hmac = bytes.fromhex(ack_msg['hmac'])
                     h = hmac.HMAC(self.auth_key, hashes.SHA256())
                     h.update(b"ACK")
@@ -915,7 +854,7 @@ class SecureClient:
         except Exception as e:
             logger.error(f"Exception during logout: {e}")
         finally:
-            # Delete all session keys for Perfect Forward Secrecy (PFS)
+            # Ensure PFS
             self.session_key = None
             self.auth_key = None
             self.peer_keys.clear()
